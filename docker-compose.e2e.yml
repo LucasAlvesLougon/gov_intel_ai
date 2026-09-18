@@ -1,0 +1,16 @@
+# Override para E2E determinístico: providers de IA mockados.
+# Uso: docker compose -f docker-compose.yml -f docker-compose.e2e.yml up -d --build
+services:
+  api:
+    environment:
+      GEMINI_API_KEY: mock
+      OPENROUTER_API_KEY: mock
+      LLM_PROVIDER: mock
+      EMBEDDING_PROVIDER: mock
+
+  worker:
+    environment:
+      GEMINI_API_KEY: mock
+      OPENROUTER_API_KEY: mock
+      LLM_PROVIDER: mock
+      EMBEDDING_PROVIDER: mock

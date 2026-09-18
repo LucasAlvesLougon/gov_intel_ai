@@ -1,0 +1,297 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "24.17.0"
+  POSTGRES_DB: govintel_db
+  POSTGRES_USER: govintel_user
+  POSTGRES_PASSWORD: ci-db-password
+  RABBITMQ_DEFAULT_USER: govintel
+  RABBITMQ_DEFAULT_PASS: ci-broker-password
+  RABBITMQ_DEFAULT_VHOST: govintel
+  DJANGO_SECRET_KEY: ci-only-django-secret
+  DATABASE_URL: postgresql://govintel_user:ci-db-password@db:5432/govintel_db
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: amqp://govintel:ci-broker-password@rabbitmq:5672/govintel
+  CELERY_RESULT_BACKEND: redis://redis:6379/1
+  DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1,api
+  FRONTEND_ORIGIN: http://localhost:3000
+  FRONTEND_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+  API_BASE_URL: http://api:8000
+  NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+  LLM_PROVIDER: mock
+  GEMINI_API_KEY: mock
+  OPENROUTER_API_KEY: mock
+  EMBEDDING_PROVIDER: mock
+  LOCAL_EMBEDDING_MODEL: intfloat/multilingual-e5-base
+  LOCAL_EMBEDDING_DIMENSIONS: "768"
+
+jobs:
+  backend-quality:
+    name: Backend lint and tests
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://govintel_user:ci-db-password@localhost:5432/govintel_db
+      REDIS_URL: redis://localhost:6379/0
+      CELERY_BROKER_URL: amqp://govintel:ci-broker-password@localhost:5672/govintel
+      CELERY_RESULT_BACKEND: redis://localhost:6379/1
+    services:
+      db:
+        image: pgvector/pgvector:0.8.6-pg16-bookworm
+        env:
+          POSTGRES_DB: govintel_db
+          POSTGRES_USER: govintel_user
+          POSTGRES_PASSWORD: ci-db-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U govintel_user -d govintel_db"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      rabbitmq:
+        image: rabbitmq:4.2-management-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: govintel
+          RABBITMQ_DEFAULT_PASS: ci-broker-password
+          RABBITMQ_DEFAULT_VHOST: govintel
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/uv.lock
+      - name: Install pinned uv
+        run: python -m pip install --disable-pip-version-check "uv==0.12.5"
+      - name: Install Tesseract OCR
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-por
+      - name: Install locked dependencies
+        run: uv sync --locked
+      - name: Apply migrations and declare queues
+        run: |
+          uv run python manage.py migrate --noinput
+          uv run python manage.py declare_queues
+      - name: Ruff
+        run: uv run ruff check .
+      - name: Unit and domain tests with coverage
+        run: uv run pytest --cov=. --cov-report=term-missing --cov-report=xml
+      - name: Upload backend coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: backend/coverage.xml
+
+  frontend-quality:
+    name: Frontend lint, types, tests and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+      - name: Lint and formatting
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Tests with coverage
+        run: npm run test:coverage
+      - name: Production build
+        run: npm run build
+      - name: Upload frontend coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-coverage
+          path: frontend/coverage/
+          if-no-files-found: ignore
+
+  integration:
+    name: Integration with pgvector, Redis and RabbitMQ
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: pgvector/pgvector:0.8.6-pg16-bookworm
+        env:
+          POSTGRES_DB: govintel_db
+          POSTGRES_USER: govintel_user
+          POSTGRES_PASSWORD: ci-db-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U govintel_user -d govintel_db"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      rabbitmq:
+        image: rabbitmq:4.2-management-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: govintel
+          RABBITMQ_DEFAULT_PASS: ci-broker-password
+          RABBITMQ_DEFAULT_VHOST: govintel
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      DATABASE_URL: postgresql://govintel_user:ci-db-password@localhost:5432/govintel_db
+      REDIS_URL: redis://localhost:6379/0
+      CELERY_BROKER_URL: amqp://govintel:ci-broker-password@localhost:5672/govintel
+      CELERY_RESULT_BACKEND: redis://localhost:6379/1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/uv.lock
+      - name: Install pinned uv
+        run: python -m pip install --disable-pip-version-check "uv==0.12.5"
+      - name: Install Tesseract OCR
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-por
+      - name: Install locked dependencies
+        run: uv sync --locked
+      - name: Apply migrations
+        run: uv run python manage.py migrate --noinput
+      - name: Declare durable queues
+        run: uv run python manage.py declare_queues
+      - name: Integration tests with coverage
+        run: uv run pytest --cov=. --cov-report=term-missing
+
+  security:
+    name: Dependency and secret audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/uv.lock
+      - name: Install pinned uv
+        run: python -m pip install --disable-pip-version-check "uv==0.12.5"
+      - name: Install locked backend dependencies
+        working-directory: backend
+        run: uv sync --locked
+      - name: Python dependency audit
+        working-directory: backend
+        run: |
+          uv export --locked --no-dev --format requirements.txt \
+            --no-emit-package torch --output-file "$RUNNER_TEMP/govintel-requirements.txt"
+          uv run pip-audit --strict --disable-pip \
+            -r "$RUNNER_TEMP/govintel-requirements.txt"
+          uv run python -c "import torch; assert torch.__version__.endswith('+cpu'), torch.__version__"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+      - name: Install locked root dependencies
+        run: npm ci --ignore-scripts
+      - name: Audit root dependencies
+        run: npm audit --audit-level=high
+      - name: Install locked frontend dependencies
+        working-directory: frontend
+        run: npm ci --ignore-scripts
+      - name: Audit frontend dependencies
+        working-directory: frontend
+        run: npm audit --audit-level=high
+      - name: Secret pattern scan
+        shell: bash
+        run: |
+          if git grep -nEI '(AIza[0-9A-Za-z_-]{20,}|-----BEGIN [A-Z ]+ PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{20,})' -- . ':(exclude).env.example'; then
+            echo "Potential credential pattern found in tracked files." >&2
+            exit 1
+          fi
+
+  docker-build:
+    name: Reproducible Docker images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose
+        run: docker compose config --quiet
+      - name: Build API, worker and frontend images
+        run: docker compose build --pull api worker frontend
+
+  e2e:
+    name: Playwright demo flow
+    runs-on: ubuntu-latest
+    needs: [backend-quality, frontend-quality, integration, docker-build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install E2E dependencies
+        run: npm ci --ignore-scripts
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Start deterministic demo stack
+        run: docker compose -f docker-compose.yml -f docker-compose.e2e.yml up -d --build --wait
+      - name: Run E2E flow
+        run: npx playwright test e2e/govintel-flow.spec.ts
+      - name: Upload Playwright diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+      - name: Tear down demo stack
+        if: always()
+        run: docker compose -f docker-compose.yml -f docker-compose.e2e.yml down -v

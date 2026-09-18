@@ -1,0 +1,13 @@
+{
+  "name": "govintel-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed",
+    "e2e:report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.53.0"
+  }
+}

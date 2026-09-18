@@ -1,0 +1,181 @@
+x-backend-environment: &backend-environment
+  DATABASE_URL: ${DATABASE_URL:?Configure DATABASE_URL em .env}
+  REDIS_URL: ${REDIS_URL:?Configure REDIS_URL em .env}
+  CELERY_BROKER_URL: ${CELERY_BROKER_URL:?Configure CELERY_BROKER_URL em .env}
+  CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:?Configure CELERY_RESULT_BACKEND em .env}
+  DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Configure DJANGO_SECRET_KEY em .env}
+  DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,api}
+  FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
+  FRONTEND_ORIGINS: ${FRONTEND_ORIGINS:-}
+  LLM_PROVIDER: ${LLM_PROVIDER:-opencode}
+  OPENCODE_API_KEY: ${OPENCODE_API_KEY:-}
+  OPENCODE_BASE_URL: ${OPENCODE_BASE_URL:-https://opencode.ai/zen/v1}
+  OPENCODE_CHAT_MODEL: ${OPENCODE_CHAT_MODEL:-deepseek-v4-flash}
+  EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+  LOCAL_EMBEDDING_MODEL: ${LOCAL_EMBEDDING_MODEL:-intfloat/multilingual-e5-base}
+  LOCAL_EMBEDDING_DIMENSIONS: ${LOCAL_EMBEDDING_DIMENSIONS:-768}
+  LOCAL_EMBEDDING_DEVICE: ${LOCAL_EMBEDDING_DEVICE:-cpu}
+  LOCAL_EMBEDDING_BATCH_SIZE: ${LOCAL_EMBEDDING_BATCH_SIZE:-32}
+  LOCAL_EMBEDDING_REVISION: ${LOCAL_EMBEDDING_REVISION:-main}
+  LOCAL_EMBEDDING_CACHE_DIR: ${LOCAL_EMBEDDING_CACHE_DIR:-/var/lib/govintel/huggingface}
+  SENTENCE_TRANSFORMERS_HOME: ${SENTENCE_TRANSFORMERS_HOME:-/var/lib/govintel/huggingface}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+  OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+  OPENROUTER_LLM_MODEL: ${OPENROUTER_LLM_MODEL:-xiaomi/mimo-v2.5}
+  OPENROUTER_EMBEDDING_MODEL: ${OPENROUTER_EMBEDDING_MODEL:-openai/text-embedding-3-small}
+  UPLOAD_ROOT: /var/lib/govintel/uploads
+  UPLOAD_RETENTION_DAYS: ${UPLOAD_RETENTION_DAYS:-30}
+
+x-service: &service
+  restart: unless-stopped
+  stop_grace_period: 30s
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+x-health: &health
+  interval: 10s
+  timeout: 5s
+  retries: 12
+  start_period: 30s
+
+services:
+  db:
+    <<: *service
+    image: pgvector/pgvector:0.8.6-pg16-bookworm
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-govintel_db}
+      POSTGRES_USER: ${POSTGRES_USER:-govintel_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Configure POSTGRES_PASSWORD em .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      <<: *health
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+    shm_size: 256m
+    mem_limit: 1g
+    cpus: 1.0
+    networks: [data]
+
+  redis:
+    <<: *service
+    image: redis:7.4-alpine
+    command: [redis-server, --maxmemory, 192mb, --maxmemory-policy, noeviction, --save, "", --appendonly, "no"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      <<: *health
+      test: [CMD, redis-cli, ping]
+    mem_limit: 256m
+    cpus: 0.5
+    networks: [data]
+
+  rabbitmq:
+    <<: *service
+    image: rabbitmq:4.2-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-govintel}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?Configure RABBITMQ_DEFAULT_PASS em .env}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_DEFAULT_VHOST:-govintel}
+      RABBITMQ_NODENAME: rabbit@govintel-broker
+    hostname: govintel-broker
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "127.0.0.1:${RABBITMQ_PORT:-5672}:5672"
+      - "127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    healthcheck:
+      <<: *health
+      test: [CMD, rabbitmq-diagnostics, -q, ping]
+    mem_limit: 768m
+    cpus: 1.0
+    networks: [data]
+
+  api:
+    <<: *service
+    build: ./backend
+    init: true
+    user: "10001:10001"
+    # multilingual-e5-base é carregado em memória no processo que atende a busca.
+    command: [sh, -c, "python manage.py migrate --noinput && exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 1 --timeout 60"]
+    environment: *backend-environment
+    volumes:
+      - private_uploads:/var/lib/govintel/uploads
+      - embedding_model_cache:/var/lib/govintel/huggingface
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+    healthcheck:
+      <<: *health
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/', timeout=3)"]
+    mem_limit: 2g
+    cpus: 2.0
+    networks: [data, web]
+
+  worker:
+    <<: *service
+    build: ./backend
+    init: true
+    user: "10001:10001"
+    # Task 2 declara filas antes do worker; Task 13 acrescenta relay/outbox real.
+    command: [sh, -c, "python manage.py declare_queues && exec celery -A config worker --loglevel=WARNING --concurrency=1 --hostname=worker@%h"]
+    environment: *backend-environment
+    volumes:
+      - private_uploads:/var/lib/govintel/uploads
+      - embedding_model_cache:/var/lib/govintel/huggingface
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+      api: {condition: service_healthy}
+    healthcheck:
+      <<: *health
+      timeout: 10s
+      test: [CMD-SHELL, 'celery -A config inspect ping --destination "worker@$$HOSTNAME" --timeout 5']
+    stop_grace_period: 90s
+    mem_limit: 2g
+    cpus: 2.0
+    networks: [data, web]
+
+  frontend:
+    <<: *service
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:?Configure NEXT_PUBLIC_API_BASE_URL em .env}
+    init: true
+    user: "1000:1000"
+    environment:
+      API_BASE_URL: ${API_BASE_URL:?Configure API_BASE_URL em .env}
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+      NEXT_TELEMETRY_DISABLED: "1"
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      api: {condition: service_healthy}
+    healthcheck:
+      <<: *health
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    mem_limit: 1g
+    cpus: 1.0
+    networks: [web]
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  private_uploads:
+  embedding_model_cache:
+
+networks:
+  data:
+  web:
