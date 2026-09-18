@@ -29,7 +29,7 @@
     "@vitest/coverage-v8": "4.1.11",
     "eslint": "^9.0.0",
     "eslint-config-next": "15.5.25",
-    "jsdom": "27.4.0",
+    "jsdom": "30.0.1",
     "prettier": "^3.0.0",
     "typescript": "~5.9.0",
     "vitest": "4.1.11"
