@@ -31,7 +31,7 @@
     "eslint-config-next": "15.5.25",
     "jsdom": "27.4.0",
     "prettier": "^3.0.0",
-    "typescript": "~5.9.0",
+    "typescript": "~7.0.2",
     "vitest": "4.1.11"
   },
   "overrides": {
